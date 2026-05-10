@@ -29,6 +29,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -50,6 +51,8 @@ import io.lettuce.core.api.async.RedisAsyncCommands;
 import io.lettuce.core.api.async.RedisKeyAsyncCommands;
 import io.lettuce.core.api.async.RedisScriptingAsyncCommands;
 import io.lettuce.core.api.async.RedisServerAsyncCommands;
+import io.lettuce.core.cluster.SlotHash.OrdinalPositionTrackingPartitonElementConsumer;
+import io.lettuce.core.cluster.SlotHash.OridnalPositionKeys;
 import io.lettuce.core.cluster.api.NodeSelectionSupport;
 import io.lettuce.core.cluster.api.StatefulRedisClusterConnection;
 import io.lettuce.core.cluster.api.async.AsyncNodeSelection;
@@ -412,33 +415,38 @@ public class RedisAdvancedClusterAsyncCommandsImpl<K, V> extends AbstractRedisAs
 
     @Override
     public RedisFuture<List<KeyValue<K, V>>> mget(Iterable<K> keys) {
-        Map<Integer, List<K>> partitioned = SlotHash.partition(codec, keys);
+
+        final OrdinalPositionTrackingPartitonElementConsumer<K> keyConsumer = new OrdinalPositionTrackingPartitonElementConsumer<K>();
+        Map<Integer, OridnalPositionKeys<K>> partitioned = SlotHash.partition(codec, keys, keyConsumer);
 
         if (partitioned.size() < 2) {
-            return super.mget(keys);
+            if (partitioned.size() == 1) {
+                return super.mget(partitioned.values().iterator().next().getKeys());
+            } else {
+                return super.mget(keys);
+            }
+
         }
 
-        // For a given partition, maps the key to its index within the List<K> in partitioned for faster lookups below
-        Map<Integer, Map<K, Integer>> partitionedKeysToIndexes = mapKeyToIndex(partitioned);
-        Map<K, Integer> slots = SlotHash.getSlots(partitioned);
         Map<Integer, RedisFuture<List<KeyValue<K, V>>>> executions = new HashMap<>(partitioned.size());
-
-        for (Map.Entry<Integer, List<K>> entry : partitioned.entrySet()) {
-            RedisFuture<List<KeyValue<K, V>>> mget = super.mget(entry.getValue());
+        for (Entry<Integer, OridnalPositionKeys<K>> entry : partitioned.entrySet()) {
+            RedisFuture<List<KeyValue<K, V>>> mget = super.mget(entry.getValue().getKeys());
             executions.put(entry.getKey(), mget);
         }
 
         // restore order of key
         return new PipelinedRedisFuture<>(executions, objectPipelinedRedisFuture -> {
-            List<KeyValue<K, V>> result = new ArrayList<>(slots.size());
-            for (K opKey : keys) {
-                int slot = slots.get(opKey);
+            List<KeyValue<K, V>> result = new ArrayList<>(keyConsumer.totalKeys());
 
-                int position = partitionedKeysToIndexes.get(slot).get(opKey);
-                RedisFuture<List<KeyValue<K, V>>> listRedisFuture = executions.get(slot);
-                result.add(MultiNodeExecution.execute(() -> listRedisFuture.get().get(position)));
+            for (Entry<Integer, OridnalPositionKeys<K>> partition : partitioned.entrySet()) {
+                // first redis future we get is the first one requested but might be that last to return
+                List<KeyValue<K, V>> listRedisFuture = MultiNodeExecution
+                        .execute(() -> executions.get(partition.getKey()).get());
+                int i = 0; // exec result maybe not indexable
+                for (KeyValue<K, V> resultEntry : listRedisFuture) {
+                    result.set(partition.getValue().getOrdinalPosition(i++), resultEntry);
+                }
             }
-
             return result;
         });
     }

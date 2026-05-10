@@ -55,6 +55,8 @@ import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.reactive.RedisKeyReactiveCommands;
 import io.lettuce.core.api.reactive.RedisScriptingReactiveCommands;
 import io.lettuce.core.api.reactive.RedisServerReactiveCommands;
+import io.lettuce.core.cluster.SlotHash.OrdinalPositionTrackingPartitonElementConsumer;
+import io.lettuce.core.cluster.SlotHash.OridnalPositionKeys;
 import io.lettuce.core.cluster.api.StatefulRedisClusterConnection;
 import io.lettuce.core.cluster.api.reactive.RedisAdvancedClusterReactiveCommands;
 import io.lettuce.core.cluster.api.reactive.RedisClusterReactiveCommands;
@@ -346,28 +348,31 @@ public class RedisAdvancedClusterReactiveCommandsImpl<K, V> extends AbstractRedi
 
     @SuppressWarnings({ "unchecked", "rawtypes" })
     public Flux<KeyValue<K, V>> mget(Iterable<K> keys) {
-        List<K> keyList = LettuceLists.newList(keys);
-        Map<Integer, List<K>> partitioned = SlotHash.partition(codec, keyList);
+
+        OrdinalPositionTrackingPartitonElementConsumer<K> keyConsumer = new OrdinalPositionTrackingPartitonElementConsumer<K>();
+        Map<Integer, OridnalPositionKeys<K>> partitioned = SlotHash.partition(codec, keys, keyConsumer);
 
         if (partitioned.size() < 2) {
-            return super.mget(keyList);
+            if (partitioned.size() == 1) {
+                return super.mget(partitioned.values().iterator().next().getKeys());
+            } else {
+                return super.mget(new ArrayList<K>());
+            }
         }
 
-        List<Publisher<KeyValue<K, V>>> publishers = partitioned.values().stream().map(super::mget)
-                .collect(Collectors.toList());
+        List<Publisher<KeyValue<K, V>>> publishers = partitioned.values().stream().map((partKeys) -> partKeys.getKeys())
+                .map(super::mget).collect(Collectors.toList());
 
+        // We should be able to reorder the results without collecting to another big list first
         return Flux.mergeSequential(publishers).collectList().map(results -> {
-            KeyValue<K, V>[] values = new KeyValue[keyList.size()];
-            int offset = 0;
+            KeyValue<K, V>[] values = new KeyValue[keyConsumer.totalKeys()];
+            int resultPosition = 0;
 
-            for (List<K> partitionKeys : partitioned.values()) {
-                for (int i = 0; i < keyList.size(); i++) {
-                    int index = partitionKeys.indexOf(keyList.get(i));
-                    if (index != -1) {
-                        values[i] = results.get(offset + index);
-                    }
+            for (OridnalPositionKeys<K> partitionKeys : partitioned.values()) {
+                for (int i = 0; i < partitionKeys.getKeys().size(); i++) {
+                    int originalPosition = partitionKeys.getOrdinalPosition(i);
+                    values[originalPosition] = results.get(resultPosition);
                 }
-                offset += partitionKeys.size();
             }
 
             return Arrays.asList(values);

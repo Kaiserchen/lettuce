@@ -6,6 +6,8 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiFunction;
+import java.util.function.Function;
 
 import io.lettuce.core.codec.CRC16;
 import io.lettuce.core.codec.RedisCodec;
@@ -111,20 +113,36 @@ public class SlotHash {
      * @param <V> Value type.
      * @return map between slot-hash and an ordered list of keys.
      */
-    public static <K, V> Map<Integer, List<K>> partition(RedisCodec<K, V> codec, Iterable<K> keys) {
+    public static <K, V, P> Map<Integer, P> partition(RedisCodec<K, V> codec, Iterable<K> keys,
+            PartitionElementConsumer<K, P> slotElementConsumer) {
 
-        Map<Integer, List<K>> partitioned = new HashMap<>();
+        Map<Integer, P> partitioned = new HashMap<>();
 
         for (K key : keys) {
             int slot = getSlot(codec.encodeKey(key));
-            if (!partitioned.containsKey(slot)) {
-                partitioned.put(slot, new ArrayList<>());
-            }
-            Collection<K> list = partitioned.get(slot);
-            list.add(key);
+            P partition = partitioned.computeIfAbsent(slot, (K) -> slotElementConsumer.newPartition());
+            slotElementConsumer.addElement(partition, key);
         }
 
         return partitioned;
+    }
+
+    public static <K, V> Map<Integer, List<K>> partition(RedisCodec<K, V> codec, Iterable<K> keys) {
+
+        PartitionElementConsumer<K, List<K>> partitionCollectior = new PartitionElementConsumer<K, List<K>>() {
+
+            @Override
+            public List<K> newPartition() {
+                return new ArrayList<K>(); // LinkedList probably better call here but leave as before
+            }
+
+            @Override
+            public void addElement(List<K> partition, K key) {
+                partition.add(key);
+            }
+
+        };
+        return partition(codec, keys, partitionCollectior);
     }
 
     /**
@@ -146,6 +164,63 @@ public class SlotHash {
         }
 
         return result;
+    }
+
+    public interface PartitionElementConsumer<K, P> {
+
+        public P newPartition();
+
+        public void addElement(P partition, K elem);
+
+    }
+
+    public static class OridnalPositionKeys<K> {
+
+        private List<K> partitionKeys;
+
+        private List<Integer> ordinalPosition;
+
+        public OridnalPositionKeys() {
+            partitionKeys = new ArrayList<K>();
+            ordinalPosition = new ArrayList<Integer>();
+        }
+
+        public void addElement(K key, int ordinalPosition) {
+            this.partitionKeys.add(key);
+            this.ordinalPosition.add(ordinalPosition);
+        }
+
+        public List<K> getKeys() {
+            return this.partitionKeys;
+        }
+
+        public Integer getOrdinalPosition(int partitionPosition) {
+            return this.ordinalPosition.get(partitionPosition);
+        }
+
+    }
+
+    public static class OrdinalPositionTrackingPartitonElementConsumer<K>
+            implements PartitionElementConsumer<K, OridnalPositionKeys<K>> {
+
+        // keeping track here internally or better explicitly in the partition loop?
+        private int nextPosition = 0;
+
+        @Override
+        public OridnalPositionKeys<K> newPartition() {
+            return new OridnalPositionKeys<K>();
+        }
+
+        @Override
+        public void addElement(OridnalPositionKeys<K> partition, K elem) {
+            partition.addElement(elem, nextPosition);
+            this.nextPosition++;
+        }
+
+        public int totalKeys() {
+            return this.nextPosition;
+        }
+
     }
 
 }
